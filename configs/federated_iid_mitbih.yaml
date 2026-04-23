@@ -1,0 +1,16 @@
+_base_: "federated_base.yaml"
+run_id: "federated_mitbih_fedavg_iid_seed42"
+dataset: "mitbih"
+model: "cnn1d"
+
+training:
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+
+federation:
+  strategy: "fedavg"
+  partition: "iid"
+  num_clients: 5
+  rounds: 50
+  local_epochs: 5

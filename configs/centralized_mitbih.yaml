@@ -1,0 +1,10 @@
+_base_: "base.yaml"
+run_id: "centralized_mitbih_cnn1d_seed42"
+dataset: "mitbih"
+model: "cnn1d"
+training:
+  epochs: 50
+  batch_size: 64
+  lr: 0.001
+  augment: false
+  early_stop_patience: 15

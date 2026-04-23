@@ -1,0 +1,21 @@
+_base_: "base.yaml"
+
+training:
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  optimizer: "adamw"
+
+federation:
+  num_clients: 5
+  rounds: 50
+  local_epochs: 5
+  strategy: "fedavg"
+  partition: "iid"
+  proximal_mu: 0.0
+  fedperf_alpha: 0.5
+  fedbn_central_eval: "representative"
+  central_eval_every: 1
+  dirichlet_alpha: 0.5
+  quantity_beta: 0.5
+  classes_per_client: 2

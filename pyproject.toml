@@ -1,0 +1,13 @@
+[project]
+name = "medicalfl"
+version = "0.1.0"
+description = "DP-FedBN: differentially private federated learning for ECG classification"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --tb=short"

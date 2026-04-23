@@ -1,0 +1,11 @@
+_base_: "base.yaml"
+run_id: "centralized_ptbxl_cnn1d_binary_seed42"
+dataset: "ptbxl"
+model: "cnn1d"
+training:
+  epochs: 50
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 0.0005
+  augment: true
+  early_stop_patience: 10

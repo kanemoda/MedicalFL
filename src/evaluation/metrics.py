@@ -134,27 +134,43 @@ def metrics_to_jsonable(metrics: dict) -> dict:
 
 
 def format_classification_report(metrics: dict) -> str:
-    """Pretty-print per-class P/R/F1 + macro averages for logs."""
-    lines = []
-    names = metrics["class_names"]
-    header = f"{'class':>8} {'prec':>7} {'rec':>7} {'f1':>7} {'support':>9}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    for i, name in enumerate(names):
-        p = metrics["per_class_precision"][i]
-        r = metrics["per_class_recall"][i]
-        f = metrics["per_class_f1"][i]
-        s = metrics["support"][i]
-        ps = f"{p:7.4f}" if not (isinstance(p, float) and math.isnan(p)) else "    nan"
-        rs = f"{r:7.4f}" if not (isinstance(r, float) and math.isnan(r)) else "    nan"
-        fs = f"{f:7.4f}" if not (isinstance(f, float) and math.isnan(f)) else "    nan"
-        lines.append(f"{name:>8} {ps} {rs} {fs} {s:>9}")
-    lines.append("-" * len(header))
-    lines.append(
-        f"{'macro':>8} {metrics['precision_macro']:7.4f} {metrics['recall_macro']:7.4f} "
-        f"{metrics['f1_macro']:7.4f}"
-    )
-    auc = metrics["auc_macro"]
-    auc_str = f"{auc:.4f}" if not (isinstance(auc, float) and math.isnan(auc)) else "nan"
-    lines.append(f"accuracy={metrics['accuracy']:.4f}  auc_macro={auc_str}")
+    """Pretty-print the available classification metrics.
+
+    Tolerates slim metric dicts (e.g. FedBN ``client_avg`` aggregates) that
+    omit per-class breakdowns or support counts. Whatever keys are present
+    are printed; whatever is missing is simply skipped.
+    """
+    def _fmt_f(v) -> str:
+        return f"{v:.4f}" if isinstance(v, (int, float)) and not (
+            isinstance(v, float) and math.isnan(v)
+        ) else "nan"
+
+    lines: list[str] = []
+    if "accuracy" in metrics:
+        lines.append(f"accuracy: {_fmt_f(metrics['accuracy'])}")
+    if "f1_macro" in metrics:
+        lines.append(f"f1_macro: {_fmt_f(metrics['f1_macro'])}")
+    if "auc_macro" in metrics:
+        lines.append(f"auc_macro: {_fmt_f(metrics['auc_macro'])}")
+
+    if "per_class_f1" in metrics:
+        per_f1 = metrics["per_class_f1"]
+        names = metrics.get(
+            "class_names", [f"c{i}" for i in range(len(per_f1))]
+        )
+        has_pr = "per_class_precision" in metrics and "per_class_recall" in metrics
+        if has_pr:
+            lines.append("per-class (P/R/F1):")
+            for i, name in enumerate(names):
+                p = metrics["per_class_precision"][i]
+                r = metrics["per_class_recall"][i]
+                f = per_f1[i]
+                lines.append(
+                    f"  {name}: P={_fmt_f(p)} R={_fmt_f(r)} F1={_fmt_f(f)}"
+                )
+        else:
+            lines.append("per-class F1:")
+            for i, name in enumerate(names):
+                lines.append(f"  {name}: F1={_fmt_f(per_f1[i])}")
+
     return "\n".join(lines)

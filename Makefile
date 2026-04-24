@@ -36,7 +36,11 @@ train-fed:
 	$(PY) scripts/run_experiment.py --config $(CONFIG) --mode federated
 
 sweep-noniid:
-	@echo "Phase 4 stub: non-IID sweep not yet implemented"
+	$(PY) scripts/validate_partitions.py
+	$(PY) scripts/run_noniid_sweep.py
+
+figures-phase4:
+	$(PY) -c "from src.evaluation.visualization import generate_phase4_figures; generate_phase4_figures('results/metrics', 'results/figures')"
 
 sweep-dp:
 	@echo "Phase 5 stub: DP sweep not yet implemented"

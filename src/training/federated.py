@@ -203,6 +203,55 @@ def _git_sha() -> str:
         return "unknown"
 
 
+def _evaluate_local_test(
+    clients: list[FederatedClient],
+    strategy: str,
+    global_params: dict[str, torch.Tensor],
+    client_states: list[dict[str, torch.Tensor]],
+) -> dict:
+    """Per-client evaluation on each client's own val split.
+
+    Uses each client's 20% val loader as a proxy for a local test slice —
+    val was never used for gradient updates, only convergence monitoring.
+    Parallels the 15% central stratified test but is drawn from the client's
+    own (non-IID) distribution.
+
+    - For FedBN: load each client's post-local-training state (personalized
+      model with local BN) and evaluate on its own val_loader.
+    - For FedAvg/FedProx/FedPerf: load the globally aggregated model into
+      each client and evaluate on its val_loader.
+    """
+    per_client_f1: list[float] = []
+    per_client_acc: list[float] = []
+    per_client_auc: list[float] = []
+    per_client_n: list[int] = []
+
+    for c_id, client in enumerate(clients):
+        if strategy == "fedbn":
+            client.model.load_state_dict(client_states[c_id], strict=True)
+        else:
+            client.set_parameters(global_params)
+        m = client.evaluate()
+        per_client_f1.append(float(m.get("f1_macro", float("nan"))))
+        per_client_acc.append(float(m.get("accuracy", float("nan"))))
+        auc_v = m.get("auc_macro", float("nan"))
+        per_client_auc.append(float(auc_v) if auc_v == auc_v else float("nan"))
+        per_client_n.append(int(m.get("num_samples", 0)))
+
+    f1_arr = np.array(per_client_f1, dtype=np.float64)
+    acc_arr = np.array(per_client_acc, dtype=np.float64)
+    return {
+        "per_client_local_test_f1": per_client_f1,
+        "per_client_local_test_accuracy": per_client_acc,
+        "per_client_local_test_auc": per_client_auc,
+        "per_client_local_test_num_samples": per_client_n,
+        "local_test_f1_mean": float(np.nanmean(f1_arr)) if f1_arr.size else float("nan"),
+        "local_test_f1_std": float(np.nanstd(f1_arr)) if f1_arr.size else float("nan"),
+        "local_test_accuracy_mean": float(np.nanmean(acc_arr)) if acc_arr.size else float("nan"),
+        "eval_regime": "fedbn_personalized" if strategy == "fedbn" else "global_model_on_local_split",
+    }
+
+
 def _plot_fed_curves(rounds: list[dict], out_path: Path) -> None:
     rs = [r["round"] for r in rounds]
     val_f1 = [r["val_f1_weighted"] for r in rounds]
@@ -460,14 +509,30 @@ def train_federated(config: dict, dataset_name: str) -> dict:
     # --- Save checkpoint ---
     ckpt_dir = RESULTS / "checkpoints" / run_id
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    client_states_snap = [c.snapshot() for c in clients]
     ckpt = {
         "round": rounds,
         "global_params": server.global_params,
-        "client_states": [c.snapshot() for c in clients],
+        "client_states": client_states_snap,
         "strategy": strategy,
         "bn_keys": list(server.bn_keys),
     }
     torch.save(ckpt, ckpt_dir / "final.pt")
+
+    # --- Per-client local test evaluation (val split) ---
+    local_test = _evaluate_local_test(
+        clients=clients,
+        strategy=strategy,
+        global_params=server.global_params,
+        client_states=client_states_snap,
+    )
+    logger.info(
+        "local test eval: "
+        f"mean_f1={local_test['local_test_f1_mean']:.4f} "
+        f"std={local_test['local_test_f1_std']:.4f} "
+        f"per_client={[f'{v:.3f}' for v in local_test['per_client_local_test_f1']]} "
+        f"regime={local_test['eval_regime']}"
+    )
 
     # --- Figures ---
     curves_fig = RESULTS / "figures" / f"{run_id}_fed_curves.png"
@@ -511,6 +576,7 @@ def train_federated(config: dict, dataset_name: str) -> dict:
         }
     if final_central_metrics is not None and final_central_metrics is not final_eval:
         result["best_round_central_metrics"] = metrics_to_jsonable(final_central_metrics)
+    result["local_test"] = local_test
 
     metrics_path = RESULTS / "metrics" / f"{run_id}.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)

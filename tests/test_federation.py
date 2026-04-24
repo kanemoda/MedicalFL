@@ -31,7 +31,7 @@ from src.federation.aggregation import (  # noqa: E402
     fedperf_aggregate,
     get_bn_key_set,
 )
-from src.federation.client import FederatedClient  # noqa: E402
+from src.federation.client import FederatedClient, compute_class_weights  # noqa: E402
 from src.federation.server import FederationServer  # noqa: E402
 from src.models.cnn1d import CNN1D  # noqa: E402
 
@@ -243,3 +243,36 @@ def test_aggregate_dispatch_rejects_unknown():
     sd = {"w": torch.zeros(3)}
     with pytest.raises(ValueError):
         aggregate("notastrategy", [sd], [1])
+
+
+def test_class_weights_with_missing_class(caplog):
+    """y = [0,0,0,1,1], num_classes=5 → weights finite; warnings for absent classes."""
+    import logging
+    logger = logging.getLogger("test_cw_missing")
+    logger.setLevel(logging.WARNING)
+    y = np.array([0, 0, 0, 1, 1], dtype=np.int64)
+
+    with caplog.at_level(logging.WARNING, logger="test_cw_missing"):
+        w = compute_class_weights(y, num_classes=5, logger=logger, client_id=7)
+
+    # All weights must be finite.
+    assert np.all(np.isfinite(w)), f"non-finite weights: {w}"
+    # Present classes (0, 1) have real counts (3, 2) → finite positive weights.
+    # Absent classes (2, 3, 4) get floor-1 inflated weights: 5/(5*1) = 1.0.
+    assert w[2] == pytest.approx(1.0)
+    assert w[3] == pytest.approx(1.0)
+    assert w[4] == pytest.approx(1.0)
+    # Class 0: 5 / (5 * 3) ≈ 0.333
+    assert w[0] == pytest.approx(5.0 / (5 * 3))
+    # Class 1: 5 / (5 * 2) = 0.5
+    assert w[1] == pytest.approx(0.5)
+    # Warnings fired for classes with <5 samples: all 5 classes (counts 3,2,0,0,0).
+    warning_text = " ".join(r.message for r in caplog.records)
+    for c in [0, 1, 2, 3, 4]:
+        assert f"class {c}" in warning_text, f"missing warning for class {c}"
+
+
+def test_class_weights_empty_client_returns_uniform():
+    y = np.array([], dtype=np.int64)
+    w = compute_class_weights(y, num_classes=5)
+    assert np.allclose(w, np.ones(5))

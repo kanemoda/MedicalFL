@@ -1,0 +1,44 @@
+_base_: "federated_base.yaml"
+dataset: "mitbih"
+model: "cnn1d"
+
+training:
+  augment: false
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0005
+
+federation:
+  rounds: 50
+  local_epochs: 5
+  num_clients: 5
+  proximal_mu: 0.01      # used only when strategy == fedprox
+  fedperf_alpha: 0.5     # used only when strategy == fedperf
+  fedbn_central_eval: "client_avg"  # primary metric for FedBN per Phase 3
+
+sweep:
+  seed: 42
+  partitions:
+    - name: "iid"
+      fn: "iid"
+      kwargs: {}
+    - name: "label_skew_c2"
+      fn: "label_skew"
+      kwargs: {classes_per_client: 2}
+    - name: "quantity_skew"
+      fn: "quantity_skew"
+      kwargs: {beta: 0.5}
+    - name: "dirichlet_a01"
+      fn: "dirichlet"
+      kwargs: {alpha: 0.1}
+    - name: "dirichlet_a05"
+      fn: "dirichlet"
+      kwargs: {alpha: 0.5}
+    - name: "dirichlet_a10"
+      fn: "dirichlet"
+      kwargs: {alpha: 1.0}
+  aggregations:
+    - "fedavg"
+    - "fedprox"
+    - "fedbn"
+    - "fedperf"

@@ -14,6 +14,7 @@ added to the local loss. `mu == 0` collapses to FedAvg/FedBN.
 """
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from typing import Iterable
 
@@ -23,6 +24,53 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.evaluation.metrics import compute_metrics
+
+
+# ---------------------------------------------------------------------------
+# Class-weight utility (zero-safe for non-IID partitions)
+# ---------------------------------------------------------------------------
+
+_MIN_CLASS_COUNT_WARN = 5
+
+
+def compute_class_weights(
+    y: np.ndarray,
+    num_classes: int,
+    *,
+    logger: logging.Logger | None = None,
+    client_id: int | None = None,
+) -> np.ndarray:
+    """Inverse-frequency class weights that survive zero counts.
+
+    Under extreme non-IID (Dirichlet α=0.1, label-skew C=2) a client may hold
+    zero samples of a rare class. `np.bincount` reports count=0 for those,
+    which makes a naive `1/count` weight blow up. We floor the denominator at
+    1 *for the weight computation only* — the numerator uses the true sum so
+    class ratios for present classes remain correct.
+
+    Consequences for an absent class at a client:
+      - Its weight is inflated (`total / (K * 1)`) but it contributes zero to
+        the per-batch loss because no samples of it exist locally.
+      - Federated aggregation propagates that class's parameters from clients
+        that do hold it. No need to collapse num_classes per client.
+    """
+    counts = np.bincount(y, minlength=num_classes).astype(np.float64)
+    safe_counts = np.maximum(counts, 1.0)
+    total = float(counts.sum())
+    # If the client is empty, uniform weights.
+    if total <= 0.0:
+        return np.ones(num_classes, dtype=np.float64)
+    weights = total / (num_classes * safe_counts)
+
+    if logger is not None:
+        prefix = f"client {client_id}: " if client_id is not None else ""
+        for c in range(num_classes):
+            if counts[c] < _MIN_CLASS_COUNT_WARN:
+                logger.warning(
+                    f"{prefix}class {c} has only {int(counts[c])} samples; "
+                    f"inflated weight {weights[c]:.2f}"
+                )
+    return weights
 
 
 def _numpy_to_tensor_loader(

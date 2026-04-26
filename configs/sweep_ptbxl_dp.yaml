@@ -32,6 +32,9 @@ sweep:
     - name: "label_skew_c1"
       fn: "label_skew"
       kwargs: {classes_per_client: 1}
+    - name: "dirichlet_a01"
+      fn: "dirichlet"
+      kwargs: {alpha: 0.1}
 
   method_eps_matrix:
     - ["dp_fedavg",           "fedavg",           "fedavg", "inf"]

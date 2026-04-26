@@ -87,6 +87,11 @@ def _build_run_config(
     dp_mode: str,
     aggregation: str,
     target_eps: float | None,
+    *,
+    run_id_override: str | None = None,
+    rounds_override: int | None = None,
+    local_epochs_override: int | None = None,
+    num_clients_override: int | None = None,
 ) -> tuple[dict, str]:
     run_cfg = copy.deepcopy(base_cfg)
     run_cfg.pop("sweep", None)
@@ -94,6 +99,12 @@ def _build_run_config(
     fed = run_cfg.setdefault("federation", {})
     fed["strategy"] = aggregation
     fed["partition"] = partition["fn"]
+    if rounds_override is not None:
+        fed["rounds"] = int(rounds_override)
+    if local_epochs_override is not None:
+        fed["local_epochs"] = int(local_epochs_override)
+    if num_clients_override is not None:
+        fed["num_clients"] = int(num_clients_override)
 
     kwargs = partition.get("kwargs") or {}
     if "alpha" in kwargs:
@@ -113,7 +124,9 @@ def _build_run_config(
     dp["target_epsilon"] = target_eps
 
     eps_str = _eps_to_str(target_eps)
-    run_id = f"{method}_{partition['name']}_eps{eps_str}_ptbxl_seed{run_cfg['seed']}"
+    run_id = run_id_override or (
+        f"{method}_{partition['name']}_eps{eps_str}_ptbxl_seed{run_cfg['seed']}"
+    )
     run_cfg["run_id"] = run_id
     return run_cfg, run_id
 
@@ -179,6 +192,49 @@ def _extract_row(
     return row
 
 
+def _run_smoke_test(cfg: dict) -> tuple[bool, str]:
+    """Quick smoke: DP-FedBN on dirichlet_a01 at ε=3, 2 clients × 5 rounds × 1 epoch.
+
+    Returns (passed, message). Cleans up its own metric files before returning.
+    """
+    smoke_partition = {
+        "name": "dirichlet_a01",
+        "fn": "dirichlet",
+        "kwargs": {"alpha": 0.1},
+    }
+    run_id = "SMOKE_dp_fedbn_dirichlet_a01_eps3.0_ptbxl"
+    run_cfg, _ = _build_run_config(
+        cfg, smoke_partition,
+        method="dp_fedbn", dp_mode="fedbn", aggregation="fedbn",
+        target_eps=3.0,
+        run_id_override=run_id,
+        rounds_override=5,
+        local_epochs_override=1,
+        num_clients_override=2,
+    )
+    print(f"\n[SMOKE] dp_fedbn on dirichlet_a01 ε=3 (2 clients × 5 rounds × 1 epoch)", flush=True)
+    t0 = time.time()
+    try:
+        train_federated(run_cfg, DATASET)
+        elapsed = time.time() - t0
+        msg = f"PASSED in {elapsed:.1f}s ({elapsed/60:.1f} min)"
+        print(f"[SMOKE] {msg}", flush=True)
+        return True, msg
+    except Exception as e:  # noqa: BLE001
+        tb = traceback.format_exc()
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        (LOG_DIR / f"{run_id}_crash.log").write_text(tb)
+        msg = f"FAILED — {type(e).__name__}: {e}"
+        print(f"[SMOKE] {msg}", flush=True)
+        print(f"[SMOKE] traceback at results/logs/{run_id}_crash.log", flush=True)
+        return False, msg
+    finally:
+        for suffix in (".json", "_rounds.csv"):
+            p = METRICS_DIR / f"{run_id}{suffix}"
+            if p.exists():
+                p.unlink()
+
+
 def _write_summary(
     cfg: dict, partitions: list[dict], method_matrix: list[list[Any]],
 ) -> Path:
@@ -237,6 +293,14 @@ def main() -> int:
         "--dry-run", action="store_true",
         help="List the run matrix without training.",
     )
+    parser.add_argument(
+        "--smoke-only", action="store_true",
+        help="Run only the smoke test (dp_fedbn on dirichlet_a01 ε=3, ~3 min).",
+    )
+    parser.add_argument(
+        "--skip-smoke", action="store_true",
+        help="Skip the smoke test before the full sweep.",
+    )
     args = parser.parse_args()
 
     cfg_path = (
@@ -267,6 +331,16 @@ def main() -> int:
                 )
                 print(f"  - {run_id}")
         return 0
+
+    if args.smoke_only:
+        ok, _ = _run_smoke_test(cfg)
+        return 0 if ok else 2
+
+    if not args.skip_smoke:
+        ok, msg = _run_smoke_test(cfg)
+        if not ok:
+            print(f"\nSMOKE FAILED — aborting full sweep. {msg}")
+            return 2
 
     progress_csv = METRICS_DIR / "ptbxl_dp_sweep_progress.csv"
     _init_progress_csv(progress_csv)

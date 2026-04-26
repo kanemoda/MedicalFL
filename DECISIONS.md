@@ -430,3 +430,163 @@ Resume semantics: 3 DONE JSONs cause SKIP rows; 2 dp_fedavg finite-ε refusals r
     - ε=∞ runs: 18 – 20 min
     - finite-ε runs: 41 – 54 min
 - The 3 preserved batch=16 runs by contrast: ε=∞ ≈ 80–90 min, finite-ε ≈ 6.6 h. The speedup paid for itself many times over.
+
+## Phase 6 — Cross-task validation: PTB-XL binary (2026-04-26)
+
+### Scope
+
+Cross-task replication of the Phase 4 eval-regime finding (FedBN ranks below
+FedAvg on central F1 but above on local F1) and the Phase 5 DP-FedBN study,
+on PTB-XL binary record-level classification (Normal vs Abnormal). Goal:
+confirm that the FedBN-vs-FedAvg sign flip generalises from the 5-class
+beat-classification task to the 2-class record-classification task, both
+no-DP and under DP.
+
+Same speedup config as Phase 5: batch=96, rounds=30, local_epochs=5,
+num_clients=5, seed=42, target_delta=1e-5, max_grad_norm=1.0, max_physical_batch_size=96.
+
+### Phase 6A — Non-DP PTB-XL sweep (2026-04-25)
+
+4 aggregations × 3 partitions (iid, label_skew_c1, dirichlet_a01) = 12 runs.
+Per-run wall-clock 11.7–12.5 min on RTX 4070; full sweep ~2.4 h.
+
+dirichlet_a01 results (the meaningful cross-task cell):
+
+| aggregation | central F1 (best) | local F1 (mean ± std) |
+|-|-|-|
+| FedAvg  | 0.8043 | 0.4645 ± 0.1478 |
+| FedProx | 0.8172 | 0.6607 ± 0.1132 |
+| **FedBN** | **0.6879** | **0.5878 ± 0.1028** |
+| FedPerf | 0.8051 | 0.4193 ± 0.2336 |
+
+**FedBN−FedAvg gap: central −0.116, local +0.123.** The sign flip is preserved
+on PTB-XL — FedBN is the worst central model, but in local eval it beats
+FedAvg by a larger margin (+0.123) than on MIT-BIH (+0.017 at the same
+α=0.1 partition). Phase 4 finding generalises across tasks.
+
+iid + label_skew_c1 results recorded in `results/metrics/ptbxl_summary.csv`
+for completeness; `label_skew_c1` shows the FedBN trivial-collapse case
+(local F1 = 1.000 for FedBN; each binary client owns one class).
+
+### Why label_skew_c1 was abandoned for the DP cross-task study
+
+PTB-XL is binary, and `classes_per_client=1` gives every client exactly
+one class. FedBN's local model trivially predicts the constant class for
+its client, hence local F1 = 1.0000 (std = 0.0000) on every DP-FedBN run,
+regardless of ε. Numerically valid, empirically meaningless — the result
+provides no signal on whether DP-FedBN preserves a personalisation
+advantage under DP.
+
+Concretely, yesterday's PTB-XL DP sweep on label_skew_c1 (2026-04-25):
+
+| method | ε=∞ | ε=3 | ε=1 |
+|-|-|-|-|
+| dp_fedavg (raw BN) | local 0.401 | REFUSED | REFUSED |
+| dp_fedavg+groupnorm | local 0.600 | local 0.400 | local 0.400 |
+| dp_fedbn | local 1.000 | local 1.000 | local 1.000 |
+
+The FedAvg/GroupNorm locals are also degenerate (each client predicts its
+single class with central-eval F1 ≈ 0.36), but at least their per-client
+std isn't zero. FedBN's std is exactly 0 — an unambiguous signature of
+trivial single-class prediction.
+
+dirichlet_a01 (α=0.1) gives skewed-but-non-degenerate clients (each client
+gets a non-zero share of both classes) and produces meaningful local F1
+numbers, as the smoke test confirmed below.
+
+### Smoke test (2026-04-26 15:50)
+
+Single run: dp_fedbn dirichlet_a01 ε=3, 2 clients × 5 rounds × 1 local epoch.
+PASSED in 64s. Achieved ε=2.992; local F1=0.469±0.015; per-client F1=[0.484, 0.454].
+Non-trivial signal — confirms the dirichlet_a01 + DP + PTB-XL stack works
+end-to-end before committing 2.5 h to the full sweep.
+
+### Phase 6B-v2 — DP sweep on dirichlet_a01 (2026-04-26)
+
+3 methods × 3 ε on dirichlet_a01 = 9 runs (2 expected REFUSE, 7 effective).
+Resumes the Phase 6B sweep config; existing 9 label_skew_c1 rows skipped.
+
+dirichlet_a01 results:
+
+| method                | ε       | achieved ε  | central F1 (best) | local F1 (mean ± std) |
+|-|-|-|-|-|
+| dp_fedavg (raw BN)    | ∞       | —           | 0.807 | 0.552 ± 0.162 |
+| dp_fedavg (raw BN)    | 3       | —           | REFUSED | REFUSED |
+| dp_fedavg (raw BN)    | 1       | —           | REFUSED | REFUSED |
+| dp_fedavg + GroupNorm | ∞       | —           | 0.784 | 0.443 ± 0.142 |
+| dp_fedavg + GroupNorm | 3       | 2.9943      | 0.774 | 0.669 ± 0.109 |
+| dp_fedavg + GroupNorm | 1       | 0.9953      | 0.765 | 0.715 ± 0.148 |
+| **DP-FedBN**          | ∞       | —           | 0.688 | 0.604 ± 0.125 |
+| **DP-FedBN**          | 3       | 2.9943      | 0.400 | 0.435 ± 0.054 |
+| **DP-FedBN**          | 1       | 0.9953      | 0.451 | 0.526 ± 0.146 |
+
+Wall-clock: 7 done · 7 skipped · 4 failed (the 4 dp_fedavg-at-finite-ε cells
+across both partitions, all the same Opacus `UnsupportedModuleError` for
+BatchNorm) · total 1.89 h. Per-run time matches Phase 5: ε=∞ ≈ 11.6–12.6 min,
+finite-ε ≈ 18.9–20.0 min.
+
+**DP-FedBN's local advantage does not survive DP on PTB-XL dirichlet_a01.**
+At ε=∞ (no noise), DP-FedBN local F1 = 0.604 beats DP-FedAvg+GroupNorm local
+F1 = 0.443 by **+0.161** — the Phase 6A non-DP rank flip is preserved when
+DP infrastructure is plumbed but no noise is added. But at finite ε, the
+ordering reverses:
+
+- ε=3: DP-FedBN local 0.435 vs DP-GroupNorm local 0.669 → **−0.234** (FedBN worse)
+- ε=1: DP-FedBN local 0.526 vs DP-GroupNorm local 0.715 → **−0.189** (FedBN worse)
+
+Central F1 tells the same story more starkly: DP-FedBN drops from 0.688 at
+ε=∞ to 0.400 (ε=3) and 0.451 (ε=1), while DP-GroupNorm holds ~0.78 across
+all three. The mechanism: FedBN's BN-stat-not-shared design — clients keep
+their own running stats, never averaged — gives the personalisation edge in
+no-DP, but under DP each client's BN stats are noised independently, the
+noise never gets averaged out across clients, and the global model can't
+recover.
+
+Counterintuitive secondary: DP-GroupNorm local F1 *increases* as ε
+decreases (0.443 → 0.669 → 0.715). The ε=∞ run finished with central F1
+0.785 (best) → 0.537 (final), i.e. the model was already diverging by
+round 30; the finite-ε runs end at central final F1 0.756 / 0.757, so DP
+noise + gradient clipping plausibly act as regularisation here. Single-seed
+artifact suspected; multi-seed needed to settle. For now: report as a
+caveat in Phase 6 figures, not as a claim about DP's effect.
+
+ε calibration tight: 2.9943 vs target 3.0 (+0.2 %); 0.9953 vs target 1.0
+(−0.5 %) — well inside Phase 5's 10 % gate.
+
+### Cross-task validation outcome
+
+- **Non-DP**: confirmed. FedBN ranks below FedAvg on central F1 and above on
+  local F1 on both MIT-BIH 5-class beats (Phase 4) and PTB-XL binary records
+  (Phase 6A), at the same dirichlet_a01 partition. Sign flip in
+  FedBN−FedAvg gap: MIT-BIH (−0.209 → +0.017), PTB-XL (−0.116 → +0.123).
+
+- **DP**: not confirmed on dirichlet_a01. The Phase 6A non-DP eval-regime
+  rank flip (FedBN-vs-FedAvg local advantage) is preserved at ε=∞ in DP form
+  (DP-FedBN beats DP-GroupNorm by +0.161 on local), but reverses under
+  finite-ε DP — DP-GroupNorm wins on both central and local at ε=3 and ε=1.
+  This generalises the Phase 5 mixed-on-dirichlet pattern (MIT-BIH:
+  ε=3 −0.008, ε=1 +0.115 — basically tied) to PTB-XL, where the gap goes
+  decisively in DP-GroupNorm's favour. The label-skew partition where
+  Phase 5 saw +0.17 at ε=3 (MIT-BIH label_skew_c2) is not replicable on
+  PTB-XL binary, since `classes_per_client=1` collapses every binary
+  client to a single class. **Honest paper claim**: DP-FedBN's edge is
+  partition-dependent — it shows up under label-skew non-IID with ≥3
+  classes, not under Dirichlet skew at α=0.1, on either dataset.
+
+### Figures + tables
+
+- `results/figures/fig_phase6_central_vs_local_ptbxl.{png,pdf}` — single
+  panel, PTB-XL non-DP at dirichlet_a01, 4 aggregations × (central, local)
+  bars; FedBN−FedAvg local gap callout.
+- `results/figures/fig_phase6_dp_privacy_utility_ptbxl.{png,pdf}` — 2-panel
+  (central + local), PTB-XL DP at dirichlet_a01 over ε ∈ {1, 3, ∞}, 3 DP
+  methods.
+- `results/figures/fig_phase6_cross_task_summary.{png,pdf}` — money figure:
+  MIT-BIH (left) + PTB-XL (right), each with 4 grouped (central, local) bars
+  and the FedBN−FedAvg gap shown for both eval regimes; the sign flip is
+  the headline.
+- `results/metrics/ptbxl_summary.csv` — Phase 6A non-DP, 12 rows.
+- `results/metrics/ptbxl_dp_summary.csv` — Phase 6B + 6B-v2 DP, both
+  partitions (label_skew_c1 + dirichlet_a01); label_skew_c1 rows kept for
+  completeness with the trivial-FedBN-local note above.
+

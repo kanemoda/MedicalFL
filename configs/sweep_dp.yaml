@@ -1,0 +1,47 @@
+_base_: "federated_base.yaml"
+dataset: "mitbih"
+model: "cnn1d"
+
+training:
+  # Phase 5 speedup (2026-04-25 12:10): batch 16→96, rounds 50→30,
+  # num_workers 4, pin_memory true. GPU was at 700/6144 MB and 22-89%
+  # util at batch 16; we have ample headroom and need to land before
+  # the 29-Apr advisor deadline. See DECISIONS.md.
+  batch_size: 96
+  num_workers: 4
+  pin_memory: true
+  lr: 0.001
+  weight_decay: 0.0005
+
+federation:
+  rounds: 30
+  local_epochs: 5
+  num_clients: 5
+  fedbn_central_eval: "client_avg"  # primary FedBN metric (per Phase 3)
+
+dp:
+  target_delta: 1.0e-5
+  max_grad_norm: 1.0
+  max_physical_batch_size: 96
+
+sweep:
+  seed: 42
+  partitions:
+    - name: "label_skew_c2"
+      fn: "label_skew"
+      kwargs: {classes_per_client: 2}
+    - name: "dirichlet_a01"
+      fn: "dirichlet"
+      kwargs: {alpha: 0.1}
+
+  method_eps_matrix:
+    # [method_name, dp_mode, aggregation, target_epsilon]
+    - ["dp_fedavg",           "fedavg",           "fedavg", "inf"]
+    - ["dp_fedavg",           "fedavg",           "fedavg", 3.0]
+    - ["dp_fedavg",           "fedavg",           "fedavg", 1.0]
+    - ["dp_fedavg_groupnorm", "fedavg_groupnorm", "fedavg", "inf"]
+    - ["dp_fedavg_groupnorm", "fedavg_groupnorm", "fedavg", 3.0]
+    - ["dp_fedavg_groupnorm", "fedavg_groupnorm", "fedavg", 1.0]
+    - ["dp_fedbn",            "fedbn",            "fedbn",  "inf"]
+    - ["dp_fedbn",            "fedbn",            "fedbn",  3.0]
+    - ["dp_fedbn",            "fedbn",            "fedbn",  1.0]

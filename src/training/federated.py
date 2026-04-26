@@ -59,6 +59,8 @@ from src.models.cnn1d import CNN1D
 from src.utils.logging import get_logger
 from src.utils.seeding import set_all_seeds
 
+import math as _math
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESULTS = REPO_ROOT / "results"
 
@@ -228,7 +230,11 @@ def _evaluate_local_test(
 
     for c_id, client in enumerate(clients):
         if strategy == "fedbn":
-            client.model.load_state_dict(client_states[c_id], strict=True)
+            # Snapshots are keyed on the *inner* (Opacus-unwrapped) module;
+            # load there so DP runs — where `client.model` is a
+            # ``GradSampleModule`` with a ``_module.`` key prefix — still
+            # accept the plain keys.
+            client._inner().load_state_dict(client_states[c_id], strict=True)
         else:
             client.set_parameters(global_params)
         m = client.evaluate()
@@ -325,6 +331,30 @@ def train_federated(config: dict, dataset_name: str) -> dict:
         "classes_per_client": int(fed_cfg.get("classes_per_client", 2)),
     }
 
+    # -- DP config --
+    dp_cfg_raw = config.get("dp", {}) or {}
+    dp_enabled = bool(dp_cfg_raw.get("enabled", False))
+    dp_mode = str(dp_cfg_raw.get("mode", "fedbn")).lower() if dp_enabled else None
+    dp_target_epsilon_raw = dp_cfg_raw.get("target_epsilon", None) if dp_enabled else None
+    dp_target_epsilon: float | None
+    if dp_target_epsilon_raw is None:
+        dp_target_epsilon = None
+    else:
+        dp_target_epsilon = float(dp_target_epsilon_raw)
+        if _math.isinf(dp_target_epsilon):
+            dp_target_epsilon = None  # +inf → no DP
+    dp_target_delta = float(dp_cfg_raw.get("target_delta", 1e-5))
+    dp_max_grad_norm = float(dp_cfg_raw.get("max_grad_norm", 1.0))
+    dp_max_physical_batch_size = int(
+        dp_cfg_raw.get("max_physical_batch_size",
+                       int(config["training"]["batch_size"]))
+    )
+    dp_has_noise = dp_enabled and dp_target_epsilon is not None
+    logger.info(
+        f"dp: enabled={dp_enabled} mode={dp_mode} target_eps={dp_target_epsilon} "
+        f"target_delta={dp_target_delta} max_grad_norm={dp_max_grad_norm}"
+    )
+
     logger.info(
         f"federation: strategy={strategy} partition={partition_strategy} "
         f"clients={num_clients} rounds={rounds} local_epochs={local_epochs} "
@@ -371,7 +401,30 @@ def train_federated(config: dict, dataset_name: str) -> dict:
     logger.info(f"pooled class weights: {class_weights.tolist()}")
 
     # --- Build clients ---
-    model_fn: Callable[[], torch.nn.Module] = lambda: CNN1D(num_classes=num_classes)
+    # Under DP-FedAvg+GroupNorm we replace BN with GN everywhere (both
+    # server ref_model and each client) so state-dict keys stay aligned.
+    if dp_enabled and dp_mode == "fedavg_groupnorm":
+        from src.federation.dp import replace_bn_with_groupnorm
+
+        def model_fn() -> torch.nn.Module:
+            return replace_bn_with_groupnorm(CNN1D(num_classes=num_classes))
+    else:
+        def model_fn() -> torch.nn.Module:  # type: ignore[no-redef]
+            return CNN1D(num_classes=num_classes)
+
+    total_local_epochs = rounds * local_epochs
+    dp_config_base: dict | None = None
+    if dp_enabled:
+        dp_config_base = {
+            "enabled": True,
+            "mode": dp_mode,
+            "target_epsilon": dp_target_epsilon,  # None for ε=∞
+            "target_delta": dp_target_delta,
+            "max_grad_norm": dp_max_grad_norm,
+            "max_physical_batch_size": dp_max_physical_batch_size,
+            "total_epochs": total_local_epochs,
+        }
+
     clients: list[FederatedClient] = []
     for c_id, ((X_tr, y_tr), (X_va, y_va)) in enumerate(client_splits):
         if y_tr.size == 0:
@@ -388,8 +441,12 @@ def train_federated(config: dict, dataset_name: str) -> dict:
             lr=float(config["training"]["lr"]),
             weight_decay=float(config["training"].get("weight_decay", 1e-4)),
             optimizer=str(config["training"].get("optimizer", "adamw")),
-            num_workers=int(config.get("num_workers", 0)),
+            num_workers=int(
+                config["training"].get("num_workers",
+                                       config.get("num_workers", 0))
+            ),
             class_weights=class_weights,
+            dp_config=dp_config_base,
         )
         clients.append(c)
         logger.info(
@@ -404,7 +461,10 @@ def train_federated(config: dict, dataset_name: str) -> dict:
         X_test, y_test,
         batch_size=int(config["training"]["batch_size"]),
         shuffle=False,
-        num_workers=int(config.get("num_workers", 0)),
+        num_workers=int(
+            config["training"].get("num_workers",
+                                   config.get("num_workers", 0))
+        ),
     )
 
     # --- Server ---
@@ -486,11 +546,27 @@ def train_federated(config: dict, dataset_name: str) -> dict:
                 central_summary["central_mode"],
             ])
 
-        logger.info(
-            f"round {r:3d}/{rounds}  val_f1_weighted={round_info['val_f1_weighted']:.4f}  "
-            f"central_f1={central_summary['central_f1_macro']:.4f}  "
-            f"mode={central_summary['central_mode']}"
-        )
+        # Refresh ε tracking once per round (cheap — queries accountant).
+        if dp_has_noise:
+            eps_per_client = [c.update_spent_epsilon() for c in clients]
+            mean_eps = (
+                float(np.nanmean([e for e in eps_per_client if e is not None]))
+                if any(e is not None for e in eps_per_client) else float("nan")
+            )
+            record["spent_epsilon_per_client"] = eps_per_client
+            record["spent_epsilon_mean"] = mean_eps
+            logger.info(
+                f"round {r:3d}/{rounds}  val_f1_weighted={round_info['val_f1_weighted']:.4f}  "
+                f"central_f1={central_summary['central_f1_macro']:.4f}  "
+                f"mode={central_summary['central_mode']}  "
+                f"ε_spent(mean)={mean_eps:.3f}"
+            )
+        else:
+            logger.info(
+                f"round {r:3d}/{rounds}  val_f1_weighted={round_info['val_f1_weighted']:.4f}  "
+                f"central_f1={central_summary['central_f1_macro']:.4f}  "
+                f"mode={central_summary['central_mode']}"
+            )
 
     runtime = time.time() - t0
     logger.info(f"federated training done in {runtime:.1f} s  best central f1={best_central_f1:.4f} @ round {best_round}")
@@ -577,6 +653,26 @@ def train_federated(config: dict, dataset_name: str) -> dict:
     if final_central_metrics is not None and final_central_metrics is not final_eval:
         result["best_round_central_metrics"] = metrics_to_jsonable(final_central_metrics)
     result["local_test"] = local_test
+
+    # DP summary — present for all runs (None values when ε=∞ / DP disabled).
+    dp_summary: dict = {
+        "enabled": dp_enabled,
+        "mode": dp_mode,
+        "target_epsilon": dp_target_epsilon,
+        "target_delta": dp_target_delta,
+        "max_grad_norm": dp_max_grad_norm,
+    }
+    if dp_has_noise:
+        final_eps = [c.update_spent_epsilon() for c in clients]
+        dp_summary["achieved_epsilon_per_client"] = final_eps
+        clean = [e for e in final_eps if e is not None and not _math.isnan(e)]
+        dp_summary["achieved_epsilon_mean"] = (
+            float(np.mean(clean)) if clean else None
+        )
+        dp_summary["achieved_epsilon_max"] = (
+            float(np.max(clean)) if clean else None
+        )
+    result["dp"] = dp_summary
 
     metrics_path = RESULTS / "metrics" / f"{run_id}.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)

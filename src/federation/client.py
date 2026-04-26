@@ -11,12 +11,28 @@ and an optimizer. Each round:
 The proximal term (`mu > 0`) is FedProx-style: a penalty
     (mu / 2) * || w - w_global ||²
 added to the local loss. `mu == 0` collapses to FedAvg/FedBN.
+
+Phase 5 — differential privacy
+------------------------------
+When a ``dp_config`` dict is passed in, the client delegates optimizer /
+model construction to ``src.federation.dp.setup_dp_training``.  The
+training loop then:
+  - wraps the loader in Opacus's ``BatchMemoryManager`` (physical batch
+    ≤ ``max_physical_batch_size``),
+  - calls ``opt_dp.step()`` each (physical) iteration — Opacus
+    accumulates per-sample grads and only performs the DP update at
+    the logical batch boundary,
+  - calls ``opt_nondp.step()`` each iteration when present (DP-FedBN
+    BN-params optimiser — plain AdamW, no noise).
+Parameter exchange ignores the Opacus ``_module.`` prefix so FedAvg /
+FedBN aggregation keeps the original state-dict key space.
 """
 from __future__ import annotations
 
 import logging
+import math
 from copy import deepcopy
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -94,6 +110,14 @@ def _numpy_to_tensor_loader(
     )
 
 
+def _inner_module(model: nn.Module) -> nn.Module:
+    """Unwrap Opacus's ``GradSampleModule`` layers for state-dict access."""
+    inner = model
+    while hasattr(inner, "_module") and isinstance(inner._module, nn.Module):
+        inner = inner._module
+    return inner
+
+
 class FederatedClient:
     def __init__(
         self,
@@ -113,12 +137,15 @@ class FederatedClient:
         optimizer: str = "adamw",
         num_workers: int = 0,
         class_weights: np.ndarray | None = None,
+        dp_config: dict[str, Any] | None = None,
     ) -> None:
         self.client_id = client_id
         self.device = device
         self.num_classes = num_classes
         self.class_names = list(class_names)
         self.num_samples = int(len(y_train))
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
 
         self.train_loader = _numpy_to_tensor_loader(
             X_train, y_train, batch_size=batch_size, shuffle=True,
@@ -129,53 +156,106 @@ class FederatedClient:
             drop_last=False, num_workers=num_workers,
         )
 
-        self.model: nn.Module = model_fn().to(device)
+        raw_model: nn.Module = model_fn().to(device)
 
         cw = None
         if class_weights is not None:
             cw = torch.tensor(class_weights, dtype=torch.float32, device=device)
         self.criterion = nn.CrossEntropyLoss(weight=cw)
 
-        optim_name = optimizer.lower()
-        if optim_name == "adamw":
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=lr, weight_decay=weight_decay,
+        # ------------------------------------------------------------------
+        # DP wiring — when requested
+        # ------------------------------------------------------------------
+        self.dp_enabled: bool = False
+        self.dp_mode: str | None = None
+        self.privacy_engine = None
+        self.opt_nondp: torch.optim.Optimizer | None = None
+        self.dp_target_epsilon: float | None = None
+        self.dp_target_delta: float | None = None
+        self.dp_max_grad_norm: float | None = None
+        self.dp_max_physical_batch_size: int = batch_size
+        self.spent_epsilon: float | None = None
+
+        if dp_config is not None and bool(dp_config.get("enabled", False)):
+            # Lazy import avoids forcing opacus on non-DP runs.
+            from src.federation.dp import setup_dp_training
+
+            total_epochs = int(dp_config["total_epochs"])
+            target_eps = dp_config.get("target_epsilon", None)
+            target_delta = float(dp_config.get("target_delta", 1e-5))
+            max_grad_norm = float(dp_config.get("max_grad_norm", 1.0))
+            mode = str(dp_config.get("mode", "fedbn"))
+            self.dp_max_physical_batch_size = int(
+                dp_config.get("max_physical_batch_size", batch_size)
             )
-        elif optim_name == "adam":
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(), lr=lr, weight_decay=weight_decay,
+
+            setup = setup_dp_training(
+                model=raw_model,
+                train_loader=self.train_loader,
+                target_epsilon=target_eps,
+                target_delta=target_delta,
+                max_grad_norm=max_grad_norm,
+                total_epochs=total_epochs,
+                mode=mode,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
             )
-        elif optim_name == "sgd":
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay,
-            )
+            self.model = setup.model
+            self.optimizer = setup.opt_dp
+            self.opt_nondp = setup.opt_nondp
+            self.train_loader = setup.train_loader
+            self.privacy_engine = setup.privacy_engine
+            self.dp_enabled = self.privacy_engine is not None
+            self.dp_mode = setup.mode
+            self.dp_target_epsilon = setup.target_epsilon
+            self.dp_target_delta = setup.target_delta
+            self.dp_max_grad_norm = setup.max_grad_norm
         else:
-            raise ValueError(f"unsupported optimizer: {optimizer}")
+            self.model = raw_model
+            self.optimizer = _build_plain_optimizer(
+                raw_model.parameters(), optimizer, lr, weight_decay,
+            )
+
+    # ------------------------------------------------------------------
+    # Model-inner access (Opacus-safe)
+    # ------------------------------------------------------------------
+
+    def _inner(self) -> nn.Module:
+        return _inner_module(self.model)
 
     # ------------------------------------------------------------------
     # Parameter exchange
     # ------------------------------------------------------------------
 
-    def get_parameters(self, keys: Iterable[str] | None = None) -> dict[str, torch.Tensor]:
-        """Return a CPU-side copy of `state_dict` (optionally restricted to `keys`)."""
-        sd = self.model.state_dict()
+    def get_parameters(
+        self, keys: Iterable[str] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return a CPU-side copy of ``state_dict`` (optionally restricted to
+        ``keys``).
+
+        Uses the *inner* (Opacus-unwrapped) model so FedAvg/FedBN keys are
+        the plain ``conv1.weight`` variety, not ``_module.conv1.weight``.
+        """
+        sd = self._inner().state_dict()
         if keys is not None:
             keys = set(keys)
             return {k: v.detach().cpu().clone() for k, v in sd.items() if k in keys}
         return {k: v.detach().cpu().clone() for k, v in sd.items()}
 
     def set_parameters(self, params: dict[str, torch.Tensor]) -> None:
-        """Load `params` into the model; missing keys are left untouched.
+        """Load ``params`` into the inner model; missing keys left untouched.
 
-        This is the crux of FedBN: the server never sends BN keys, so those stay
-        at whatever the client held locally after the previous local step.
+        This is the crux of FedBN: the server never sends BN keys, so those
+        stay at whatever the client held locally after the previous local
+        step.
         """
-        own = self.model.state_dict()
+        inner = self._inner()
+        own = inner.state_dict()
         for k, v in params.items():
             if k not in own:
                 raise KeyError(f"param {k!r} not in client model")
             own[k] = v.to(own[k].device, dtype=own[k].dtype)
-        self.model.load_state_dict(own, strict=True)
+        inner.load_state_dict(own, strict=True)
 
     # ------------------------------------------------------------------
     # Local training
@@ -188,10 +268,17 @@ class FederatedClient:
         proximal_mu: float = 0.0,
         global_params: dict[str, torch.Tensor] | None = None,
     ) -> dict:
-        """Run `local_epochs` of SGD over the client's train set.
+        """Run ``local_epochs`` of SGD over the client's train set.
 
-        If `proximal_mu > 0`, requires `global_params` (the FedProx anchor
-        weights) and adds `(mu/2) * || w - w_global ||²` to each step's loss.
+        When DP is enabled the Opacus ``BatchMemoryManager`` splits each
+        logical (Poisson-sampled) batch into physical chunks ≤
+        ``dp_max_physical_batch_size`` and ``opt_dp.step()`` is called per
+        chunk — Opacus accumulates per-sample grads internally and only
+        performs the DP update (clip + noise) at the logical-batch
+        boundary. The separate ``opt_nondp`` (DP-FedBN BN optimiser, when
+        present) steps each physical chunk too; with our sizing (physical
+        == logical) that's one update per batch, matching standard
+        training.
         """
         if proximal_mu > 0 and global_params is None:
             raise ValueError("FedProx requires global_params when proximal_mu > 0")
@@ -210,22 +297,29 @@ class FederatedClient:
         prob_buf: list[np.ndarray] = []
 
         for _ in range(local_epochs):
-            for Xb, yb in self.train_loader:
+            iterator = self._epoch_iterator()
+            for Xb, yb in iterator:
                 Xb = Xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
+                if yb.numel() == 0:
+                    continue
                 self.optimizer.zero_grad(set_to_none=True)
+                if self.opt_nondp is not None:
+                    self.opt_nondp.zero_grad(set_to_none=True)
                 logits = self.model(Xb)
                 loss = self.criterion(logits, yb)
 
                 if anchor is not None:
                     prox = torch.zeros((), device=self.device)
-                    for name, p in self.model.named_parameters():
+                    for name, p in self._inner().named_parameters():
                         if name in anchor and p.requires_grad:
                             prox = prox + ((p - anchor[name]) ** 2).sum()
                     loss = loss + (proximal_mu / 2.0) * prox
 
                 loss.backward()
                 self.optimizer.step()
+                if self.opt_nondp is not None:
+                    self.opt_nondp.step()
 
                 running_loss += loss.item() * Xb.size(0)
                 running_n += Xb.size(0)
@@ -245,6 +339,40 @@ class FederatedClient:
         metrics = compute_metrics(y_true, y_pred, y_prob, self.class_names)
         metrics["loss"] = running_loss / max(running_n, 1)
         return metrics
+
+    def _epoch_iterator(self):
+        """Yield (Xb, yb) batches, using Opacus ``BatchMemoryManager`` under DP.
+
+        Falls back to ``self.train_loader`` directly when no privacy engine
+        is active.
+        """
+        if self.privacy_engine is None:
+            yield from self.train_loader
+            return
+
+        from opacus.utils.batch_memory_manager import BatchMemoryManager
+
+        with BatchMemoryManager(
+            data_loader=self.train_loader,
+            max_physical_batch_size=self.dp_max_physical_batch_size,
+            optimizer=self.optimizer,
+        ) as safe_loader:
+            yield from safe_loader
+
+    # ------------------------------------------------------------------
+    # Privacy accounting
+    # ------------------------------------------------------------------
+
+    def update_spent_epsilon(self) -> float | None:
+        """Query Opacus for cumulative ε; cache in ``self.spent_epsilon``."""
+        if self.privacy_engine is None or self.dp_target_delta is None:
+            return None
+        try:
+            eps = float(self.privacy_engine.get_epsilon(self.dp_target_delta))
+        except Exception:  # noqa: BLE001
+            eps = math.nan
+        self.spent_epsilon = eps
+        return eps
 
     # ------------------------------------------------------------------
     # Local evaluation
@@ -287,8 +415,25 @@ class FederatedClient:
     # ------------------------------------------------------------------
 
     def snapshot(self) -> dict[str, torch.Tensor]:
-        """Deep-copy of the model state for external inspection/checkpointing."""
-        return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        """Deep-copy of the (inner) model state for external inspection."""
+        return {k: v.detach().cpu().clone() for k, v in self._inner().state_dict().items()}
 
     def restore(self, snap: dict[str, torch.Tensor]) -> None:
-        self.model.load_state_dict(deepcopy(snap), strict=True)
+        self._inner().load_state_dict(deepcopy(snap), strict=True)
+
+
+# ---------------------------------------------------------------------------
+# Plain optimiser factory (non-DP path)
+# ---------------------------------------------------------------------------
+
+def _build_plain_optimizer(
+    params, name: str, lr: float, weight_decay: float,
+) -> torch.optim.Optimizer:
+    n = name.lower()
+    if n == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if n == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if n == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    raise ValueError(f"unsupported optimizer: {name}")

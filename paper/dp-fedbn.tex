@@ -24,6 +24,7 @@
 \usepackage{algorithmic}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{multirow}
 \usepackage{textcomp}
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
@@ -85,7 +86,7 @@ The rest of the paper is organized as follows. Section~\ref{sec:related} situate
 \section{Related Work}\label{sec:related}
 
 \subsection{FL aggregation under non-IID data}
-FedAvg~\cite{fedavg} is the standard FL algorithm: clients perform local SGD and the server averages model updates weighted by client sample counts. Under non-IID data --- where client distributions differ in covariate, label, or quantity --- FedAvg drifts and under-converges. FedProx~\cite{fedprox} adds a proximal term that anchors each round's local optimum to the global broadcast, trading some local fit for stability. FedBN~\cite{fedbn} takes a different route: it leaves FedAvg's aggregation rule unchanged for Conv/Linear parameters but \emph{excludes} BN parameters and BN running statistics from aggregation entirely. Each client's BN layer thus calibrates to that client's data distribution, acting as a learned per-client domain adapter. FedBN was originally validated on feature-shifted partitions (DomainNet, Office-Caltech). Several extensions exist, including batch-specific BN with sharpness-aware minimization~\cite{tia} and personalized data transformations~\cite{privatefl}; we treat FedBN as our personalization baseline and do not deploy these extensions.
+FedAvg~\cite{fedavg} is the standard FL algorithm: clients perform local SGD and the server averages model updates weighted by client sample counts. Under non-IID data --- where client distributions differ in covariate, label, or quantity, one of the central open problems of the field~\cite{kairouz} --- FedAvg drifts and under-converges. FedProx~\cite{fedprox} adds a proximal term that anchors each round's local optimum to the global broadcast, trading some local fit for stability. FedBN~\cite{fedbn} takes a different route: it leaves FedAvg's aggregation rule unchanged for Conv/Linear parameters but \emph{excludes} BN parameters and BN running statistics from aggregation entirely. Each client's BN layer thus calibrates to that client's data distribution, acting as a learned per-client domain adapter. FedBN was originally validated on feature-shifted partitions (DomainNet, Office-Caltech). Several extensions exist, including batch-specific BN with sharpness-aware minimization~\cite{tia} and personalized data transformations~\cite{privatefl}; we treat FedBN as our personalization baseline and do not deploy these extensions.
 
 \subsection{Differential privacy in FL}
 DP-SGD~\cite{abadi} provides $(\varepsilon,\delta)$-DP guarantees by clipping per-sample gradients to a bounded norm $C$ and adding calibrated Gaussian noise to the aggregated batch gradient. Its composition with FL is direct: each client runs DP-SGD locally, and the server's aggregation does not require additional DP because parameter updates are already DP-protected at the source~\cite{geyer}. The Opacus library~\cite{opacus} provides a PyTorch implementation including a \code{PrivacyEngine}, architectural compatibility checks (\code{ModuleValidator}), a privacy accountant, and helpers like \code{BatchMemoryManager} for memory-bounded per-sample gradient computation. We use Opacus~1.5 throughout.
@@ -141,6 +142,7 @@ The BN running statistics $(\mu, \sigma^2)$ continue to update through their nor
 \begin{algorithm}[t]
 \caption{DP-FedBN: client-side setup and one round}
 \label{alg:dpfedbn}
+\footnotesize
 \begin{algorithmic}[1]
 \REQUIRE Initial model $f_\theta$ with BN layers; train loader $\mathcal{L}_k$; target privacy budget $(\varepsilon,\delta)$; gradient clipping bound $C$.
 \STATE \textbf{Round setup} (after global broadcast)
@@ -150,7 +152,7 @@ The BN running statistics $(\mu, \sigma^2)$ continue to update through their nor
   \STATE $m.\text{bias.requires\_grad} \leftarrow \text{False}$
 \ENDFOR
 \STATE Build $\text{opt}_A \leftarrow \mathrm{AdamW}(\theta^{\overline{\mathrm{BN}}})$
-\STATE $(f_\theta, \text{opt}_A, \mathcal{L}_k) \leftarrow$ \code{PrivacyEngine.make\_private\_with\_epsilon}($\cdots$)
+\STATE $(f_\theta, \text{opt}_A, \mathcal{L}_k) \leftarrow$ \code{make\_private\_with\_epsilon}($\dots$)
 \FORALL{BN modules $m$}
   \STATE $m.\text{weight.requires\_grad} \leftarrow \text{True}$
   \STATE $m.\text{bias.requires\_grad} \leftarrow \text{True}$
@@ -288,7 +290,7 @@ We run our three DP methods (raw FedAvg, DP-FedAvg+GroupNorm, DP-FedBN) across $
 \caption{MIT-BIH DP privacy-utility benchmark (single seed, $\delta{=}10^{-5}$). Naive DP-FedAvg refused by Opacus at finite $\varepsilon$ --- the empirical motivation for DP-FedBN. On label skew, DP-FedBN keeps a $+0.17$ local-F1 advantage over DP-FedAvg+GN at $\varepsilon{=}3$; on Dirichlet the edge is mixed.}
 \label{tab:dp}
 \footnotesize
-\setlength{\tabcolsep}{4pt}
+\setlength{\tabcolsep}{3pt}
 \begin{tabular}{llcccc}
 \toprule
 Method & Partition & $\varepsilon$ & Ach.\ $\varepsilon$ & Cent.\ F1 & Local F1 \\
